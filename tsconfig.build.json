@@ -1,0 +1,27 @@
+{
+  "compilerOptions": {
+    "allowJs": true,
+    "declaration": true,
+    "emitDeclarationOnly": true,
+    "outDir": "dist",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "target": "ES2022",
+    "checkJs": false,
+    "skipLibCheck": true,
+    "strict": false,
+    "baseUrl": "."
+  },
+  "include": [
+    "src/index.js",
+    "src/actions/**/*.js",
+    "src/adapters/**/*.js",
+    "src/compat/**/*.js",
+    "src/core/**/*.js",
+    "src/runtime/**/*.js",
+    "src/search/**/*.js",
+    "src/validators.js",
+    "src/constants.js",
+    "src/errors.js"
+  ]
+}
