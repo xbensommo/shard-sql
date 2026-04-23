@@ -5,7 +5,7 @@ import { mapAdapterError } from '../core/providerErrorMapper.js';
 import { CollectionRegistry } from '../core/registry.js';
 import { derivePrimaryKeyField } from '../core/relationNaming.js';
 import { ShardProviderError, ValidationError } from '../errors.js';
-import { prepareSearchFields } from '../search/searchStrategies.js';
+import { buildSearchPlan, matchesSearchRecord, prepareSearchFields, rankSearchRecords } from '../search/searchStrategies.js';
 import { CollectionRuntime } from './collectionRuntime.js';
 import { IncludeEngine } from './includeEngine.js';
 import { runSafeCallback } from './safeCallback.js';
@@ -27,10 +27,65 @@ function defaultRange() {
   return { start, end };
 }
 
+function shouldUseDefaultRange(definition) {
+  const shardType = definition?.shard?.type || DEFAULT_CONFIG.SHARD_TYPES.NONE;
+  return shardType && shardType !== DEFAULT_CONFIG.SHARD_TYPES.NONE;
+}
+
+function chunkArray(values = [], size = 10) {
+  const chunkSize = Number.isInteger(size) && size > 0 ? size : 10;
+  const chunks = [];
+  for (let index = 0; index < values.length; index += chunkSize) {
+    chunks.push(values.slice(index, index + chunkSize));
+  }
+  return chunks;
+}
+
+function encodeCursor(payload = {}) {
+  return Buffer.from(JSON.stringify(payload)).toString('base64url');
+}
+
+function decodeCursor(cursor) {
+  if (!cursor || typeof cursor !== 'string') return null;
+  try {
+    const decoded = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8'));
+    return decoded && typeof decoded === 'object' ? decoded : null;
+  } catch {
+    return null;
+  }
+}
+
 function normalizePageSize(value) {
   const parsed = Number(value || DEFAULT_CONFIG.DEFAULT_PAGE_SIZE);
   if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_CONFIG.DEFAULT_PAGE_SIZE;
   return Math.min(Math.floor(parsed), DEFAULT_CONFIG.MAX_PAGE_SIZE);
+}
+
+function normalizePaginationInput(queryInput = {}, options = {}) {
+  const pagination = {
+    ...(options.pagination && typeof options.pagination === 'object' ? options.pagination : {}),
+    ...(queryInput.pagination && typeof queryInput.pagination === 'object' ? queryInput.pagination : {}),
+  };
+
+  const requestedMode = pagination.mode || queryInput.pageMode || options.pageMode || (pagination.cursor || queryInput.cursor || queryInput.pageToken || queryInput.after ? 'cursor' : 'offset');
+  const mode = requestedMode === 'cursor' ? 'cursor' : 'offset';
+  const pageSize = normalizePageSize(queryInput.limit || options.limit || queryInput.pageSize || options.pageSize || pagination.limit || pagination.pageSize);
+  const decodedCursor = decodeCursor(pagination.cursor || queryInput.cursor || queryInput.pageToken || queryInput.after || options.cursor || options.pageToken || options.after);
+  const cursor = pagination.cursor || queryInput.cursor || queryInput.pageToken || queryInput.after || options.cursor || options.pageToken || options.after || null;
+  const offsetFromCursor = Number.isFinite(Number(decodedCursor?.offset)) ? Math.max(0, Number(decodedCursor.offset)) : 0;
+  const offset = Number.isFinite(Number(pagination.offset))
+    ? Math.max(0, Number(pagination.offset))
+    : (Number.isFinite(Number(queryInput.offset)) ? Math.max(0, Number(queryInput.offset)) : (mode === 'cursor' ? offsetFromCursor : 0));
+
+  return {
+    mode,
+    pageSize,
+    limit: pageSize,
+    offset,
+    cursor,
+    decodedCursor,
+    direction: pagination.direction || queryInput.direction || options.direction || 'forward',
+  };
 }
 
 function nowIso() {
@@ -102,22 +157,36 @@ function normalizeRecordList(records, definition, collectionName) {
 }
 
 function normalizePageResult(result, definition, collectionName, queryInput = {}) {
+  const paginationInput = normalizePaginationInput(queryInput);
+  const requestedMode = result?.pagination?.mode || result?.mode || paginationInput.mode;
+  const mode = requestedMode === 'cursor' ? 'cursor' : 'offset';
+
   if (Array.isArray(result)) {
     const items = normalizeRecordList(result, definition, collectionName);
-    const offset = Number.isFinite(Number(queryInput.offset)) ? Math.max(0, Number(queryInput.offset)) : 0;
-    const pageSize = normalizePageSize(queryInput.limit || queryInput.pageSize);
+    const offset = paginationInput.offset;
+    const pageSize = paginationInput.pageSize;
+    const nextOffset = items.length >= pageSize ? offset + items.length : null;
+    const nextCursor = mode === 'cursor' && nextOffset !== null ? encodeCursor({ mode: 'offset', offset: nextOffset }) : null;
+    const prevOffset = offset > 0 ? Math.max(0, offset - pageSize) : null;
+    const prevCursor = mode === 'cursor' && prevOffset !== null ? encodeCursor({ mode: 'offset', offset: prevOffset }) : null;
     return {
       items,
-      total: items.length,
-      hasMore: false,
-      lastVisible: null,
+      total: mode === 'cursor' ? null : items.length,
+      hasMore: mode === 'cursor' ? Boolean(nextCursor) : false,
+      lastVisible: mode === 'cursor' ? nextCursor : null,
+      nextCursor,
+      prevCursor,
       pagination: {
-        mode: 'offset',
+        mode,
         offset,
+        cursor: paginationInput.cursor,
         pageSize,
-        nextOffset: null,
-        hasMore: false,
-        total: items.length,
+        nextOffset,
+        prevOffset,
+        nextCursor,
+        prevCursor,
+        hasMore: mode === 'cursor' ? Boolean(nextCursor) : false,
+        total: mode === 'cursor' ? null : items.length,
       },
       filters: Array.isArray(queryInput.filters) ? queryInput.filters : [],
       activeFilters: Array.isArray(queryInput.filters) ? queryInput.filters : [],
@@ -130,26 +199,39 @@ function normalizePageResult(result, definition, collectionName, queryInput = {}
   }
 
   const items = normalizeRecordList(result?.items, definition, collectionName);
-  const total = typeof result?.total === 'number' ? result.total : items.length;
   const pageSize = normalizePageSize(result?.pageSize || result?.pagination?.pageSize || queryInput.limit || queryInput.pageSize);
   const offset = Number.isFinite(Number(result?.pagination?.offset))
-    ? Number(result.pagination.offset)
-    : (Number.isFinite(Number(queryInput.offset)) ? Math.max(0, Number(queryInput.offset)) : 0);
+    ? Math.max(0, Number(result.pagination.offset))
+    : paginationInput.offset;
+  const total = typeof result?.total === 'number' ? result.total : (mode === 'cursor' ? null : items.length);
+  const nextOffset = result?.pagination?.nextOffset ?? result?.nextOffset ?? ((mode === 'offset' && typeof total === 'number' && (offset + items.length) < total) ? offset + items.length : null);
+  const prevOffset = result?.pagination?.prevOffset ?? result?.prevOffset ?? (offset > 0 ? Math.max(0, offset - pageSize) : null);
+  const nextCursor = result?.pagination?.nextCursor
+    ?? result?.nextCursor
+    ?? (mode === 'cursor' && nextOffset !== null ? encodeCursor({ mode: 'offset', offset: nextOffset }) : null);
+  const prevCursor = result?.pagination?.prevCursor
+    ?? result?.prevCursor
+    ?? (mode === 'cursor' && prevOffset !== null ? encodeCursor({ mode: 'offset', offset: prevOffset }) : null);
   const hasMore = typeof result?.hasMore === 'boolean'
     ? result.hasMore
-    : (offset + items.length) < total;
-  const nextOffset = result?.pagination?.nextOffset ?? (hasMore ? offset + items.length : null);
+    : (mode === 'cursor' ? Boolean(nextCursor) : (typeof total === 'number' ? (offset + items.length) < total : Boolean(nextOffset)));
 
   return {
     items,
     total,
     hasMore,
-    lastVisible: nextOffset,
+    lastVisible: mode === 'cursor' ? nextCursor : nextOffset,
+    nextCursor,
+    prevCursor,
     pagination: {
-      mode: result?.pagination?.mode || 'offset',
+      mode,
       offset,
+      cursor: result?.pagination?.cursor ?? result?.cursor ?? paginationInput.cursor,
       pageSize,
       nextOffset,
+      prevOffset,
+      nextCursor,
+      prevCursor,
       hasMore,
       total,
       ...(result?.pagination && typeof result.pagination === 'object' ? result.pagination : {}),
@@ -185,6 +267,8 @@ export class SqlShardProvider {
     this.registry = new CollectionRegistry(options.collections || []);
     this.runtimeCache = new Map();
     this.includeEngine = new IncludeEngine(this);
+    this.searchProvider = options.searchProvider || null;
+    this.searchScanLimit = Number.isInteger(options.searchScanLimit) && options.searchScanLimit > 0 ? options.searchScanLimit : 1000;
     this.maxBatchSize = Number.isInteger(options.maxBatchSize) && options.maxBatchSize > 0 ? options.maxBatchSize : null;
   }
 
@@ -261,11 +345,19 @@ export class SqlShardProvider {
 
   async applyBulkMutation(collectionName, ids = [], mutator, options = {}) {
     const validIds = this.normalizeBulkIds(ids, collectionName, options.operation || 'bulkMutation');
+    const concurrency = Number.isInteger(options.concurrency) && options.concurrency > 0 ? options.concurrency : 10;
+    const chunks = chunkArray(validIds, concurrency);
     const results = [];
-    for (const id of validIds) {
-      const result = await mutator(id);
-      results.push(result);
+
+    for (const batch of chunks) {
+      const settled = await Promise.allSettled(batch.map((id) => mutator(id)));
+      settled.forEach((entry) => {
+        if (entry.status === 'fulfilled') results.push(entry.value);
+      });
+      const rejected = settled.find((entry) => entry.status === 'rejected');
+      if (rejected) throw rejected.reason;
     }
+
     return results;
   }
 
@@ -284,6 +376,13 @@ export class SqlShardProvider {
     }
 
     return resolved;
+  }
+
+  resolveSearchOrderBy(definition, queryInput = {}) {
+    if (Array.isArray(queryInput.orderBy) && queryInput.orderBy.length) return queryInput.orderBy;
+    if (definition.schema.updatedAt?.sortable) return [{ field: 'updatedAt', direction: 'desc' }];
+    if (definition.schema.createdAt?.sortable) return [{ field: 'createdAt', direction: 'desc' }];
+    return [];
   }
 
   handleError(error, context = {}) {
@@ -651,7 +750,7 @@ export class SqlShardProvider {
         }],
         orderBy: options.orderBy || [],
         limit: options.limit || Math.max(DEFAULT_CONFIG.DEFAULT_PAGE_SIZE, uniqueValues.length * 25),
-        range: options.range || defaultRange(),
+        range: options.range || (shouldUseDefaultRange(this.getCollectionDefinition(collectionName)) ? defaultRange() : null),
         includeDeleted: options.includeDeleted,
         includes: options.includes,
       }, options);
@@ -664,12 +763,20 @@ export class SqlShardProvider {
     try {
       const definition = this.getCollectionRuntime(collectionName).definition;
       const operations = this.resolveCollectionAdapter(collectionName);
+      const pagination = normalizePaginationInput(queryInput, options);
       const normalizedQuery = {
         filters: Array.isArray(queryInput.filters) ? queryInput.filters : [],
         orderBy: Array.isArray(queryInput.orderBy) ? queryInput.orderBy : [],
-        limit: normalizePageSize(queryInput.limit || options.limit || queryInput.pageSize || options.pageSize),
-        offset: Number.isFinite(Number(queryInput.offset)) ? Math.max(0, Number(queryInput.offset)) : 0,
-        includeDeleted: queryInput.includeDeleted === true,
+        limit: pagination.limit,
+        pageSize: pagination.pageSize,
+        offset: pagination.offset,
+        cursor: pagination.cursor,
+        pageToken: pagination.cursor,
+        after: pagination.cursor,
+        pageMode: pagination.mode,
+        direction: pagination.direction,
+        pagination,
+        includeDeleted: queryInput.includeDeleted === true || options.includeDeleted === true,
         includes: queryInput.includes || options.includes,
         range: queryInput.range || options.range || null,
       };
@@ -683,7 +790,7 @@ export class SqlShardProvider {
         throw new ValidationError(
           DEFAULT_CONFIG.ERROR_CODES.QUERY_NOT_ALLOWED,
           `SQL adapter for '${collectionName}' does not implement fetchPage() or fetchByFilters().`,
-          { collection: collectionName, operation: 'fetchByFilters' }
+          { collection: collectionName, operation: 'fetchPage' }
         );
       }
 
@@ -692,10 +799,9 @@ export class SqlShardProvider {
       page.items = includes
         ? await this.hydrateRecords(collectionName, page.items, includes, options)
         : page.items;
-      page.total = typeof page.total === 'number' ? page.total : page.items.length;
       return page;
     } catch (error) {
-      this.handleError(error, { collection: collectionName, operation: 'fetchByFilters' });
+      this.handleError(error, { collection: collectionName, operation: 'fetchPage' });
     }
   }
 
@@ -704,22 +810,132 @@ export class SqlShardProvider {
     return Array.isArray(page?.items) ? page.items : [];
   }
 
-  async search(collectionName, term, options = {}) {
+  async searchPage(collectionName, term, queryInput = {}, options = {}) {
     try {
-      const { buildSearchQuery } = await import('../search/searchStrategies.js');
       const runtime = this.getCollectionRuntime(collectionName);
-      const filter = buildSearchQuery(runtime.definition, term);
-      const orderField = runtime.definition.schema.createdAt?.sortable ? 'createdAt' : null;
-      return this.fetchByFilters(collectionName, {
-        filters: [filter],
-        orderBy: orderField ? [{ field: orderField, direction: 'desc' }] : [],
-        limit: options.limit || DEFAULT_CONFIG.DEFAULT_PAGE_SIZE,
-        range: options.range || defaultRange(),
-        includes: options.includes,
-      }, options);
+      const definition = runtime.definition;
+      const operations = this.resolveCollectionAdapter(collectionName);
+      const mergedInput = { ...(queryInput || {}) };
+      const pagination = normalizePaginationInput(mergedInput, options);
+      const plan = buildSearchPlan(definition, term, { limit: pagination.limit });
+      const orderBy = this.resolveSearchOrderBy(definition, mergedInput);
+      const includeDeleted = mergedInput.includeDeleted === true || options.includeDeleted === true;
+      const includes = mergedInput.includes || options.includes;
+
+      if (plan.mode === DEFAULT_CONFIG.SEARCH_MODES.EXTERNAL) {
+        if (this.searchProvider) {
+          const externalResult = typeof this.searchProvider.searchPage === 'function'
+            ? await this.searchProvider.searchPage({ collectionName, definition, term, plan, queryInput: { ...mergedInput, orderBy, includeDeleted, includes, pagination }, options, provider: this })
+            : await this.searchProvider.search({ collectionName, definition, term, plan, queryInput: { ...mergedInput, orderBy, includeDeleted, includes, pagination }, options, provider: this });
+          const page = normalizePageResult(externalResult, definition, collectionName, { ...mergedInput, orderBy, includeDeleted, includes, pagination, pageMode: pagination.mode, limit: pagination.limit, offset: pagination.offset, cursor: pagination.cursor });
+          page.items = includes ? await this.hydrateRecords(collectionName, page.items, includes, options) : page.items;
+          return page;
+        }
+
+        if (typeof operations.search !== 'function') {
+          throw new ValidationError(
+            DEFAULT_CONFIG.ERROR_CODES.SEARCH_NOT_CONFIGURED,
+            `External search is configured for '${collectionName}' but no search provider or adapter search() is available.`,
+            { collection: collectionName, operation: 'search' }
+          );
+        }
+      }
+
+      if (typeof operations.search === 'function') {
+        const adapterResult = await operations.search({ collectionName, definition, term, plan, queryInput: { ...mergedInput, orderBy, includeDeleted, includes, pagination, pageMode: pagination.mode, limit: pagination.limit, offset: pagination.offset, cursor: pagination.cursor }, options, provider: this });
+        const page = normalizePageResult(adapterResult, definition, collectionName, { ...mergedInput, orderBy, includeDeleted, includes, pagination, pageMode: pagination.mode, limit: pagination.limit, offset: pagination.offset, cursor: pagination.cursor });
+        page.items = includes ? await this.hydrateRecords(collectionName, page.items, includes, options) : page.items;
+        return page;
+      }
+
+      const baseFilters = [
+        ...(Array.isArray(mergedInput.filters) ? mergedInput.filters : []),
+        ...(plan.primaryFilter ? [plan.primaryFilter] : []),
+      ];
+      const scanPageSize = Math.min(DEFAULT_CONFIG.MAX_PAGE_SIZE, Math.max(pagination.limit * 4, 50));
+      const scanLimit = Number.isInteger(options.searchScanLimit) && options.searchScanLimit > 0 ? options.searchScanLimit : this.searchScanLimit;
+      const matches = [];
+      const seenIds = new Set();
+      let rawOffset = 0;
+      let scanned = 0;
+      let hasMore = true;
+
+      while (hasMore && scanned < scanLimit) {
+        const rawPage = await this.fetchPage(collectionName, {
+          filters: baseFilters,
+          orderBy,
+          limit: scanPageSize,
+          offset: rawOffset,
+          includeDeleted,
+          range: mergedInput.range || options.range || null,
+        }, { ...options, includes: null, includeDeleted });
+
+        const candidates = Array.isArray(rawPage?.items) ? rawPage.items : [];
+        for (const record of candidates) {
+          const recordId = String(record?.id || '');
+          if (!recordId || seenIds.has(recordId)) continue;
+          seenIds.add(recordId);
+          if (matchesSearchRecord(definition, record, plan)) {
+            matches.push(record);
+          }
+        }
+
+        scanned += candidates.length;
+        hasMore = Boolean(rawPage?.hasMore) && candidates.length > 0;
+        rawOffset = Number.isFinite(Number(rawPage?.pagination?.nextOffset))
+          ? Number(rawPage.pagination.nextOffset)
+          : rawOffset + candidates.length;
+
+        if (!candidates.length) break;
+      }
+
+      const ranked = rankSearchRecords(definition, matches, plan);
+      const total = ranked.length;
+      const sliceStart = pagination.offset;
+      const sliceEnd = sliceStart + pagination.limit;
+      const items = ranked.slice(sliceStart, sliceEnd);
+      const pageHasMore = sliceEnd < total;
+      const nextOffset = pageHasMore ? sliceEnd : null;
+      const prevOffset = sliceStart > 0 ? Math.max(0, sliceStart - pagination.limit) : null;
+      const page = normalizePageResult({
+        items,
+        total,
+        hasMore: pageHasMore,
+        pagination: {
+          mode: pagination.mode,
+          offset: sliceStart,
+          pageSize: pagination.limit,
+          nextOffset,
+          prevOffset,
+          nextCursor: pagination.mode === 'cursor' && nextOffset !== null ? encodeCursor({ mode: 'offset', offset: nextOffset }) : null,
+          prevCursor: pagination.mode === 'cursor' && prevOffset !== null ? encodeCursor({ mode: 'offset', offset: prevOffset }) : null,
+          hasMore: pageHasMore,
+          total,
+        },
+        filters: baseFilters,
+        orderBy,
+        includeDeleted,
+      }, definition, collectionName, { ...mergedInput, includeDeleted, includes, pagination, pageMode: pagination.mode, limit: pagination.limit, offset: sliceStart, cursor: pagination.cursor });
+
+      page.items = includes ? await this.hydrateRecords(collectionName, page.items, includes, options) : page.items;
+      page.search = {
+        term: String(term),
+        normalized: plan.normalized,
+        mode: plan.mode,
+        tokens: plan.tokens,
+        scanned,
+        scanLimit,
+        truncated: hasMore && scanned >= scanLimit,
+      };
+      return page;
     } catch (error) {
       this.handleError(error, { collection: collectionName, operation: 'search' });
     }
+  }
+
+  async search(collectionName, term, options = {}) {
+    const page = await this.searchPage(collectionName, term, options, options);
+    return Array.isArray(page?.items) ? page.items : [];
   }
 
   getBatchLimit(options = {}) {
@@ -747,6 +963,7 @@ export class SqlShardProvider {
         return normalizedOperations;
       }
 
+      const executeOperations = async () => {
       for (const operation of normalizedOperations) {
         const collectionName = operation?.collection || operation?.collectionName;
         if (!collectionName) {
@@ -784,6 +1001,13 @@ export class SqlShardProvider {
       }
 
       return normalizedOperations;
+      };
+
+      if (typeof this.adapter.transaction === 'function') {
+        return this.adapter.transaction(async (transaction) => executeOperations(transaction));
+      }
+
+      return executeOperations();
     } catch (error) {
       this.handleError(error, { operation: 'commitWriteOperations' });
     }

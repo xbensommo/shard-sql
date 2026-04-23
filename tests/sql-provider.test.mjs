@@ -313,3 +313,95 @@ test('SqlShardProvider set and update enforce schema rules and immutable ids', a
   await assert.rejects(() => provider.set('accounts', 'acc-2', { name: 'No PK' }), (error) => expectCode(error, DEFAULT_CONFIG.ERROR_CODES.REQUIRED_FIELD));
   await assert.rejects(() => provider.update('accounts', 'acc-1', { account_id: 'changed' }), (error) => expectCode(error, DEFAULT_CONFIG.ERROR_CODES.READONLY_FIELD));
 });
+
+test('SqlShardProvider fetchPage supports cursor pagination on offset-backed adapters', async () => {
+  const rows = Array.from({ length: 5 }, (_, index) => ({
+    account_id: `acc-${index + 1}`,
+    name: `Account ${index + 1}`,
+    status: 'lead',
+    tier: 'standard',
+    isDeleted: false,
+    createdAt: `2026-01-0${index + 1}T00:00:00.000Z`,
+    updatedAt: `2026-01-0${index + 1}T00:00:00.000Z`,
+  }));
+
+  const { provider } = createSqlProvider({
+    adapterOptions: { seed: { accounts: rows } },
+  });
+
+  const firstPage = await provider.fetchPage('accounts', {
+    limit: 2,
+    pageMode: 'cursor',
+    orderBy: [{ field: 'createdAt', direction: 'asc' }],
+  });
+
+  assert.equal(firstPage.items.length, 2);
+  assert.equal(firstPage.pagination.mode, 'cursor');
+  assert.ok(firstPage.pagination.nextCursor);
+  assert.equal(firstPage.items[0].id, 'acc-1');
+
+  const secondPage = await provider.fetchPage('accounts', {
+    limit: 2,
+    pageMode: 'cursor',
+    cursor: firstPage.pagination.nextCursor,
+    orderBy: [{ field: 'createdAt', direction: 'asc' }],
+  });
+
+  assert.equal(secondPage.items.length, 2);
+  assert.equal(secondPage.items[0].id, 'acc-3');
+  assert.ok(secondPage.pagination.prevCursor);
+});
+
+test('SqlShardProvider searchPage supports multi-word token search with proper pagination', async () => {
+  const { provider } = createSqlProvider({
+    adapterOptions: {
+      seed: {
+        accounts: [
+          { account_id: 'acc-1', name: 'Jane Smith', status: 'lead', tier: 'standard', isDeleted: false, _searchText: 'jane smith', _searchTokens: ['jane', 'smith'], createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:00:00.000Z' },
+          { account_id: 'acc-2', name: 'Jane Cooper', status: 'lead', tier: 'standard', isDeleted: false, _searchText: 'jane cooper', _searchTokens: ['jane', 'cooper'], createdAt: '2026-01-02T00:00:00.000Z', updatedAt: '2026-01-02T00:00:00.000Z' },
+          { account_id: 'acc-3', name: 'Smith Jane', status: 'lead', tier: 'standard', isDeleted: false, _searchText: 'smith jane', _searchTokens: ['smith', 'jane'], createdAt: '2026-01-03T00:00:00.000Z', updatedAt: '2026-01-03T00:00:00.000Z' },
+          { account_id: 'acc-4', name: 'Jane Smith Consulting', status: 'lead', tier: 'standard', isDeleted: false, _searchText: 'jane smith consulting', _searchTokens: ['jane', 'smith', 'consulting'], createdAt: '2026-01-04T00:00:00.000Z', updatedAt: '2026-01-04T00:00:00.000Z' },
+        ],
+      },
+    },
+  });
+
+  const firstPage = await provider.searchPage('accounts', 'Jane Smith', {
+    limit: 2,
+    orderBy: [{ field: 'createdAt', direction: 'asc' }],
+  });
+
+  assert.equal(firstPage.items.length, 2);
+  assert.equal(firstPage.total, 3);
+  assert.deepEqual(firstPage.items.map((item) => item.id), ['acc-1', 'acc-4']);
+  assert.equal(firstPage.hasMore, true);
+
+  const secondPage = await provider.searchPage('accounts', 'Jane Smith', {
+    limit: 2,
+    offset: 2,
+    orderBy: [{ field: 'createdAt', direction: 'asc' }],
+  });
+
+  assert.deepEqual(secondPage.items.map((item) => item.id), ['acc-3']);
+  assert.equal(secondPage.hasMore, false);
+});
+
+test('SqlShardProvider prefix search supports partial multi-token matches', async () => {
+  const prefixDefinition = defineAccountCollection({
+    search: { mode: DEFAULT_CONFIG.SEARCH_MODES.PREFIX, fields: ['name'] },
+  });
+  const provider = new SqlShardProvider({
+    adapter: createMemorySqlAdapter({
+      seed: {
+        accounts: [
+          { account_id: 'acc-1', name: 'Jane Smith', status: 'lead', tier: 'standard', isDeleted: false, _searchText: 'jane smith', _searchTokens: ['jane', 'smith'], _searchPrefixes: ['j', 'ja', 'jan', 'jane', 's', 'sm', 'smi', 'smit', 'smith', 'jane s', 'jane sm'], createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:00:00.000Z' },
+          { account_id: 'acc-2', name: 'John Stone', status: 'lead', tier: 'standard', isDeleted: false, _searchText: 'john stone', _searchTokens: ['john', 'stone'], _searchPrefixes: ['j', 'jo', 'joh', 'john', 's', 'st', 'sto', 'ston', 'stone'], createdAt: '2026-01-02T00:00:00.000Z', updatedAt: '2026-01-02T00:00:00.000Z' },
+        ],
+      },
+    }).adapter,
+    collections: [prefixDefinition],
+  });
+
+  const results = await provider.search('accounts', 'jan smi');
+  assert.deepEqual(results.map((item) => item.id), ['acc-1']);
+});

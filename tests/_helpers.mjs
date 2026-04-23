@@ -24,6 +24,7 @@ export function defineAccountCollection(overrides = {}) {
       deletedAt: { type: FIELD_TYPES.TIMESTAMP },
       deletedBy: { type: FIELD_TYPES.STRING },
       isDeleted: { type: FIELD_TYPES.BOOLEAN, filterable: true },
+      _searchText: { type: FIELD_TYPES.STRING, system: true },
       _searchTokens: { type: FIELD_TYPES.ARRAY, system: true },
       _searchPrefixes: { type: FIELD_TYPES.ARRAY, system: true },
     },

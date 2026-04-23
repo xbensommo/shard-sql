@@ -1,8 +1,9 @@
-export function runSafeCallback(fn, payload, fallback = null) {
-  if (typeof fn !== 'function') return fallback;
+export function runSafeCallback(callback, ...args) {
+  if (typeof callback !== 'function') return;
   try {
-    return fn(payload);
+    return callback(...args);
   } catch (error) {
-    return fallback;
+    console.error('[shard-sql] callback error', error);
+    return undefined;
   }
 }

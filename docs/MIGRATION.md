@@ -10,6 +10,9 @@ This standalone package changes that in a few important ways:
 - package exports point to built artifacts, not raw source files
 - docs now describe SQL-first usage only
 - Firestore runtime and generator concerns are gone
+- page responses are normalized consistently
+- cursor-ready pagination is now supported
+- search is now stronger and supports `searchPage()`
 
 ## Import changes
 
@@ -29,6 +32,25 @@ import { SqlShardProvider } from '@xbensommo/shard-sql';
 
 Old package state: source archive only.
 New package state: buildable and publishable repository with CI workflows.
+
+## Runtime changes
+
+### Pagination
+Old behavior was mostly offset normalization.
+New behavior supports:
+- offset pages
+- cursor-ready pages
+- adapter-native cursor pagination
+- provider-generated cursor tokens for offset-backed adapters
+
+### Search
+Old behavior was minimal token/prefix filtering.
+New behavior supports:
+- `searchPage()` for page metadata
+- better multi-token token search
+- better multi-token prefix search
+- external/provider search hooks
+- adapter-native `search()` when available
 
 ## What did not change
 

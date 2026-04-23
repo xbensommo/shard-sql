@@ -1,6 +1,6 @@
 {
   "name": "@xbensommo/shard-sql",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Standalone SQL-first data provider for adapter-driven CRUD, schema validation, relation hydration, pagination, and Firebase Data Connect integration.",
   "type": "module",
   "main": "./dist/index.cjs",

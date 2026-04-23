@@ -2,7 +2,7 @@
 
 ## Goal
 
-`@xbensommo/shard-sql` is the SQL-first sibling to the Firestore shard-provider. It keeps the same high-level ergonomics where that still makes sense—collection definitions, schema validation, relation includes, pagination helpers, and sharded actions—but it removes Firestore runtime assumptions.
+`@xbensommo/shard-sql` is the SQL-first sibling to the Firestore shard-provider. It keeps the same high-level ergonomics where that still makes sense—collection definitions, schema validation, relation includes, pagination helpers, search orchestration, and sharded actions—but it removes Firestore runtime assumptions.
 
 ## Core boundaries
 
@@ -21,12 +21,14 @@ It defines:
 `SqlShardProvider` is the orchestrator.
 It is responsible for:
 - validating collection requests
-- normalizing ids and pages
+- normalizing ids and page responses
+- supporting offset and cursor pagination
 - calling adapter methods
 - applying strict schema rules
 - resolving includes through `IncludeEngine`
 - mapping adapter errors into provider errors
 - normalizing soft delete / restore behavior
+- providing built-in search fallback when adapters do not expose native search
 
 ### 3. Adapter contract
 Adapters are the execution layer.
@@ -35,16 +37,27 @@ It expects explicit operations such as:
 - `getById`
 - `fetchPage`
 - `fetchByFilters`
+- `search` (recommended)
 - `create`
 - `set`
 - `update`
 - `destroy`
 - optional `commitWriteOperations`
+- optional `transaction`
 
 This is what keeps the package expandable.
 Different engines can share the same provider contract while using different execution strategies.
 
-### 4. Includes and relations
+### 4. Search boundary
+Search can be handled in three ways:
+- adapter-native search via `operations.search()`
+- external provider search via `searchProvider`
+- provider-managed fallback search using normalized `_searchText`, `_searchTokens`, and `_searchPrefixes`
+
+For enterprise-scale datasets, adapter-native or external search is the right path.
+The built-in fallback is best for moderate datasets and compatibility.
+
+### 5. Includes and relations
 Relations remain provider-level, not adapter-level.
 That means:
 - adapters return rows

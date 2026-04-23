@@ -42,6 +42,7 @@ export const DEFAULT_CONFIG = {
     'deletedAt',
     'deletedBy',
     'isDeleted',
+    '_searchText',
     '_searchTokens',
     '_searchPrefixes',
     'shardKey',

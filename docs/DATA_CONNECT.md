@@ -6,14 +6,16 @@ That means the clean approach is:
 1. define your collection contract in this package
 2. generate Data Connect operations in your Firebase project
 3. map those generated operations through `createDataConnectAdapter()`
-4. let `SqlShardProvider` handle validation, normalization, includes, and store helpers
+4. let `SqlShardProvider` handle validation, normalization, pagination, search fallback, includes, and store helpers
 
 ## Recommended split
 
 Use this package for:
 - validation
 - provider orchestration
+- pagination normalization
 - relation metadata
+- search orchestration
 - store/page state helpers
 
 Use Firebase Data Connect for:
@@ -21,8 +23,11 @@ Use Firebase Data Connect for:
 - schema evolution
 - generated operations
 - secure backend access patterns
+- native search when needed
 
 ## Practical advice
 
 Do not try to make Data Connect behave like Firestore.
 Treat it as a typed operation layer and keep your adapter explicit.
+
+If your generated SDK can expose paginated list/search operations, wire them directly into `fetchPage()` and `search()`.
